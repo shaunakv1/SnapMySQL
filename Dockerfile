@@ -26,8 +26,12 @@ RUN apt-get update && \
 WORKDIR /app
 
 # Install Node deps first for better layer caching
-COPY package.json ./
-RUN npm ci --omit=dev
+COPY package.json package-lock.json* ./
+RUN if [ -f package-lock.json ]; then \
+    npm ci --omit=dev; \
+    else \
+    npm install --omit=dev; \
+    fi
 
 # Copy source and entrypoint
 COPY src/ ./src/

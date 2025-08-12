@@ -1,11 +1,11 @@
-version: "3.9"
 services:
   minio:
     image: minio/minio:latest
     container_name: minio
+    profiles: ["test"]
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Console
+      - "9000:9000"
+      - "9001:9001"
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -15,32 +15,40 @@ services:
 
   minio-setup:
     image: minio/mc:latest
+    profiles: ["test"]
     depends_on:
       - minio
     entrypoint: >
       /bin/sh -c "
-        mc config host add local http://minio:9000 minioadmin minioadmin --api s3v4;
+        # wait for minio to be reachable
+        until (mc alias set local http://minio:9000 minioadmin minioadmin) do
+          echo 'waiting for MinIO...'; sleep 2;
+        done;
         mc mb -p local/my-mysql-backups || true;
         mc anonymous set download local/my-mysql-backups || true;
-        sleep 3;
         echo 'MinIO bucket ensured';
       "
 
   src-mysql:
     image: mysql:8.0
+    profiles: ["test"]
     environment:
       MYSQL_ROOT_PASSWORD: srcpassword
       MYSQL_DATABASE: mydb
+    command: ["--event_scheduler=ON"]
     ports:
       - "33060:3306"
     volumes:
       - src-mysql-data:/var/lib/mysql
+      - ./test/seed:/docker-entrypoint-initdb.d:ro
 
   tgt-mysql:
     image: mysql:8.0
+    profiles: ["test"]
     environment:
       MYSQL_ROOT_PASSWORD: tgtpassword
       MYSQL_DATABASE: mydb
+    command: ["--event_scheduler=ON"]
     ports:
       - "33061:3306"
     volumes:
@@ -51,10 +59,10 @@ services:
     image: snapmysql:dev
     env_file: .env
     depends_on:
-      - src-mysql
-      - tgt-mysql
       - minio
       - minio-setup
+      - src-mysql
+      - tgt-mysql
     restart: unless-stopped
 
 volumes:

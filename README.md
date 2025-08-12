@@ -44,3 +44,17 @@ Includes Slack notifications, local Docker Compose, K8s manifests, and GH Action
 - On restore, we kill connections to target DB, archive its tables to `<db>_previous`, drop & recreate `<db>`, then restore the dump.
 - Optional post-restore verification compares table presence and row-counts (set `VERIFY_AFTER_RESTORE=true`).
 
+
+## Test Profile (with seed data)
+
+Use Compose **profiles** to bring up the full local test harness (source/target MySQL and MinIO).
+
+```bash
+# from mysql-db-backups/
+cp .env.example .env
+docker compose --profile test up --build -d
+# optional: run one full cycle
+./test/run-once.sh
+```
+
+This seeds the **source** DB with tables, rows, a view, routines, a trigger, and an event (see `test/seed/*.sql`).
