@@ -4,14 +4,19 @@ services:
     container_name: minio
     profiles: ["test"]
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Console
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
     command: server /data --console-address ":9001"
     volumes:
       - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://minio:9000/minio/health/live"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
 
   minio-setup:
     image: minio/mc:latest
@@ -20,8 +25,8 @@ services:
       - minio
     entrypoint: >
       /bin/sh -c "
-        # wait for minio to be reachable
-        until (mc alias set local http://minio:9000 minioadmin minioadmin) do
+        # wait until alias set succeeds
+        until mc alias set local http://minio:9000 minioadmin minioadmin; do
           echo 'waiting for MinIO...'; sleep 2;
         done;
         mc mb -p local/my-mysql-backups || true;
@@ -41,6 +46,11 @@ services:
     volumes:
       - src-mysql-data:/var/lib/mysql
       - ./test/seed:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-psrcpassword"]
+      interval: 3s
+      timeout: 2s
+      retries: 60
 
   tgt-mysql:
     image: mysql:8.0
@@ -53,6 +63,11 @@ services:
       - "33061:3306"
     volumes:
       - tgt-mysql-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-ptgtpassword"]
+      interval: 3s
+      timeout: 2s
+      retries: 60
 
   snapmysql:
     build: .
