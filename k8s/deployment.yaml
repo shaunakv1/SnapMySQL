@@ -1,0 +1,32 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: snapmysql
+  namespace: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: snapmysql
+  template:
+    metadata:
+      labels:
+        app: snapmysql
+    spec:
+      restartPolicy: Always
+      containers:
+        - name: snapmysql
+          image: ghcr.io/yourorg/snapmysql:main
+          imagePullPolicy: Always
+          envFrom:
+            - configMapRef:
+                name: snapmysql-config
+            - secretRef:
+                name: snapmysql-secrets
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 1Gi

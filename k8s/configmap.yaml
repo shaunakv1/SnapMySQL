@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: snapmysql-config
+  namespace: app
+data:
+  CRON_BACKUP: "0 3 * * *"
+  CRON_RESTORE: "30 3 * * *"
+  TZ: "UTC"
+  VERIFY_AFTER_RESTORE: "true"
+  KEEP_LOCAL_WORKDIR: "false"

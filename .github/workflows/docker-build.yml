@@ -1,0 +1,58 @@
+name: 🐳 SnapMySQL Docker
+
+on:
+  push:
+    paths:
+      - "mysql-db-backups/**"
+    branches: [ "main", "dev" ]
+    tags:
+      - "v*"
+  pull_request:
+    paths:
+      - "mysql-db-backups/**"
+    branches: [ "main", "dev" ]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: mysql-db-backups
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔖 Set image tags
+        id: meta
+        run: |
+          REPO="ghcr.io/${{ github.repository_owner }}/snapmysql"
+          echo "repo=$REPO" >> $GITHUB_OUTPUT
+          TAGS="$REPO:${{ github.sha }}"
+          if [[ "${{ github.ref_name }}" == "main" ]]; then TAGS="$TAGS,$REPO:main"; fi
+          if [[ "${{ github.ref_name }}" == "dev"  ]]; then TAGS="$TAGS,$REPO:dev";  fi
+          echo "tags=$TAGS" >> $GITHUB_OUTPUT
+
+      - name: 🔐 Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🐳 Build and Push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./mysql-db-backups
+          file: ./mysql-db-backups/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ steps.meta.outputs.repo }}:buildcache
+          cache-to: type=registry,ref=${{ steps.meta.outputs.repo }}:buildcache,mode=max
