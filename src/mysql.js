@@ -70,6 +70,11 @@ export async function killDbConnections({ conn, db }) {
   }
 }
 
+export async function dropAndRecreateDatabase({ conn, db }) {
+  await mysqlExecSql({ conn, sql: `DROP DATABASE IF EXISTS \`${db}\`; CREATE DATABASE \`${db}\`;` });
+  log.info({ db }, "Dropped and recreated target database.");
+}
+
 export async function listTables({ conn, db }) {
   const args = [
     ...commonMyOpts(conn),
@@ -81,27 +86,6 @@ export async function listTables({ conn, db }) {
   return stdout.split("\n").map(s => s.trim()).filter(Boolean);
 }
 
-export async function archiveExistingDatabase({ conn, db }) {
-  const prevDb = `${db}_previous`;
-  await mysqlExecSql({ conn, sql: `CREATE DATABASE IF NOT EXISTS \`${prevDb}\`;` });
-
-  const tables = await listTables({ conn, db });
-  if (tables.length) {
-    await mysqlExecSql({ conn, sql: "SET FOREIGN_KEY_CHECKS=0;" });
-    const renames = tables.map(t =>
-      `RENAME TABLE \`${db}\`.\`${t}\` TO \`${prevDb}\`.\`${t}\`;`
-    ).join("\n");
-    await mysqlExecSql({ conn, sql: renames });
-    await mysqlExecSql({ conn, sql: "SET FOREIGN_KEY_CHECKS=1;" });
-    log.info({ db, moved: tables.length }, "Archived tables to _previous.");
-  } else {
-    log.info({ db }, "No tables to archive.");
-  }
-
-  // Clean slate for routines/triggers/events too.
-  await mysqlExecSql({ conn, sql: `DROP DATABASE IF EXISTS \`${db}\`; CREATE DATABASE \`${db}\`;` });
-}
-
 export async function restoreFromSqlGz({ conn, db, sqlGzPath }) {
   // gunzip -> mysql
   const gunzip = execa("gunzip", ["-c", sqlGzPath], { stdout: "pipe" });
@@ -111,27 +95,6 @@ export async function restoreFromSqlGz({ conn, db, sqlGzPath }) {
   const mysqlProc = execa("mysql", args, { input: gunzip.stdout });
   await mysqlProc;
   log.info({ db }, "Restore completed.");
-}
-
-/**
- * Legacy helper (approximate counts; includes views as NULL).
- * Kept for compatibility but superseded by tableInventory() below.
- */
-export async function tableCounts({ conn, db }) {
-  const args = [
-    ...commonMyOpts(conn),
-    "-N",
-    "-e",
-    `SELECT table_name, table_rows FROM information_schema.tables WHERE table_schema='${db}';`,
-  ];
-  const { stdout } = await execa("mysql", args);
-  const map = new Map();
-  stdout.split("\n").forEach(line => {
-    if (!line) return;
-    const [name, rowsStr] = line.split("\t");
-    if (name) map.set(name, Number(rowsStr || 0));
-  });
-  return map;
 }
 
 /**

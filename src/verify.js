@@ -11,7 +11,7 @@ export async function verifySourceVsTarget() {
   const tgtObjects = new Set([...tgt.baseCounts.keys(), ...tgt.views]);
 
   const missingInTgt = [...srcObjects].filter(x => !tgtObjects.has(x));
-  const extraInTgt = [...tgtObjects].filter(x => !srcObjects.has(x));
+  const extraInTgt   = [...tgtObjects].filter(x => !srcObjects.has(x));
 
   // Row-count diffs only for BASE TABLES (skip views).
   const diffs = [];

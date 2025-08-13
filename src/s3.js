@@ -25,13 +25,32 @@ export async function uploadFile({ client, bucket, key, filePath, contentType="a
 }
 
 export async function putText({ client, bucket, key, text, contentType="text/plain" }) {
+  const body = Buffer.from(text, "utf8");
   await client.send(new PutObjectCommand({
     Bucket: bucket,
     Key: key,
-    Body: text,
-    ContentType: contentType
+    Body: body,
+    ContentType: contentType,
+    ContentLength: body.length,
+    CacheControl: "no-cache"
   }));
   log.info({ key }, "Uploaded text object.");
+}
+
+export async function putJsonAtomic({ client, bucket, key, json }) {
+  const tmpKey = key + ".tmp";
+  const body = Buffer.from(JSON.stringify(json, null, 2), "utf8");
+  const put = async (k) => client.send(new PutObjectCommand({
+    Bucket: bucket,
+    Key: k,
+    Body: body,
+    ContentType: "application/json",
+    ContentLength: body.length,
+    CacheControl: "no-cache"
+  }));
+  await put(tmpKey);
+  await put(key);
+  log.info({ key }, "Wrote JSON atomically via .tmp");
 }
 
 export async function getText({ client, bucket, key }) {
@@ -40,7 +59,18 @@ export async function getText({ client, bucket, key }) {
   return text;
 }
 
+export async function getJson({ client, bucket, key }) {
+  const txt = await getText({ client, bucket, key });
+  try {
+    return JSON.parse(txt);
+  } catch (e) {
+    log.error({ key, err: e }, "Failed to parse JSON");
+    throw e;
+  }
+}
+
 export async function getLatestKey({ client, bucket, db }) {
+  // legacy support for latest.txt
   const key = `${db}/latest.txt`;
   const txt = await getText({ client, bucket, key }).catch(() => null);
   if (!txt) return null;
