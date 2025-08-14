@@ -1,5 +1,4 @@
 import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
-import { log } from "./logger.js";
 import fs from "node:fs";
 
 export function s3Client(cfg) {
@@ -21,7 +20,6 @@ export async function uploadFile({ client, bucket, key, filePath, contentType="a
     Body: fs.createReadStream(filePath),
     ContentType: contentType
   }));
-  log.info({ key }, "Uploaded to S3.");
 }
 
 export async function putText({ client, bucket, key, text, contentType="text/plain" }) {
@@ -34,7 +32,6 @@ export async function putText({ client, bucket, key, text, contentType="text/pla
     ContentLength: body.length,
     CacheControl: "no-cache"
   }));
-  log.info({ key }, "Uploaded text object.");
 }
 
 export async function putJsonAtomic({ client, bucket, key, json }) {
@@ -50,7 +47,6 @@ export async function putJsonAtomic({ client, bucket, key, json }) {
   }));
   await put(tmpKey);
   await put(key);
-  log.info({ key }, "Wrote JSON atomically via .tmp");
 }
 
 export async function getText({ client, bucket, key }) {
@@ -61,12 +57,7 @@ export async function getText({ client, bucket, key }) {
 
 export async function getJson({ client, bucket, key }) {
   const txt = await getText({ client, bucket, key });
-  try {
-    return JSON.parse(txt);
-  } catch (e) {
-    log.error({ key, err: e }, "Failed to parse JSON");
-    throw e;
-  }
+  return JSON.parse(txt);
 }
 
 export async function getLatestKey({ client, bucket, db }) {

@@ -1,8 +1,10 @@
 import { cfg } from "./config.js";
 import { tableInventory } from "./mysql.js";
-import { log } from "./logger.js";
+import { mkLogger, newRid } from "./logger.js";
 
-export async function verifySourceVsTarget() {
+const log = mkLogger("verify");
+
+export async function verifySourceVsTarget(rid = newRid("v")) {
   const src = await tableInventory({ conn: cfg.src, db: cfg.src.db });
   const tgt = await tableInventory({ conn: cfg.tgt, db: cfg.tgt.db });
 
@@ -22,12 +24,16 @@ export async function verifySourceVsTarget() {
     if (a !== b) diffs.push({ table: t, src: a, tgt: b });
   }
 
+  const ok = !(missingInTgt.length || extraInTgt.length || diffs.length);
+  if (ok) log.info("V_OK", { rid, db: cfg.tgt.db, tables: src.baseCounts.size, views: src.views.size, diffs: 0 });
+  else    log.warn("V_DIFFS", { rid, db: cfg.tgt.db, missing: missingInTgt.length, extra: extraInTgt.length, diffs: diffs.length });
+
   return { missingInTgt, extraInTgt, diffs };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   verifySourceVsTarget().then((r) => {
-    log.info(r, "Verification results");
-    if (r.missingInTgt.length || r.extraInTgt.length || r.diffs.length) process.exit(2);
+    const ok = !(r.missingInTgt.length || r.extraInTgt.length || r.diffs.length);
+    if (!ok) process.exit(2);
   });
 }

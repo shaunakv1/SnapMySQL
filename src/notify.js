@@ -1,21 +1,28 @@
-import { log } from "./logger.js";
+import { mkLogger } from "./logger.js";
 
-export async function notifySlack(webhookUrl, text) {
-  if (!webhookUrl) {
-    log.warn({ text }, "No SLACK_WEBHOOK_URL configured; skipping Slack notify.");
+const log = mkLogger("notify");
+
+/**
+ * Send a Slack message if webhook is configured.
+ * Logs compact events:
+ *  - N_SKIP (no webhook)
+ *  - N_SENT (ok)
+ *  - N_FAIL (error)
+ */
+export async function notifySlack(webhook, text, rid) {
+  if (!webhook) {
+    log.warn("N_SKIP", { rid, reason: "no-webhook" });
     return;
   }
   try {
-    const res = await fetch(webhookUrl, {
+    const res = await fetch(webhook, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text })
     });
-    if (!res.ok) {
-      const msg = await res.text().catch(() => "");
-      throw new Error(`Slack webhook failed: ${res.status} ${msg}`);
-    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    log.info("N_SENT", { rid, bytes: (text || "").length });
   } catch (err) {
-    log.error({ err }, "Slack notification failed.");
+    log.error("N_FAIL", { rid, err: (err && err.message) || String(err) });
   }
 }

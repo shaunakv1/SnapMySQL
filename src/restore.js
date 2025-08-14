@@ -2,13 +2,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { cfg, requireEnv } from "./config.js";
-import { log } from "./logger.js";
+import { mkLogger, newRid } from "./logger.js";
 import { s3Client, getLatestKey, getJson, putJsonAtomic } from "./s3.js";
 import { dropAndRecreateDatabase, killDbConnections, restoreFromSqlGz } from "./mysql.js";
 import { notifySlack } from "./notify.js";
 import { execa } from "execa";
 import { GetObjectCommand } from "@aws-sdk/client-s3";
 import { fileMd5, isoUtcNow } from "./util.js";
+
+const log = mkLogger("restore");
 
 async function downloadS3ObjectToFile({ client, bucket, key, destPath }) {
   const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
@@ -21,10 +23,12 @@ async function downloadS3ObjectToFile({ client, bucket, key, destPath }) {
   return destPath;
 }
 
-export async function runRestore() {
+export async function runRestore(rid = newRid("r")) {
   requireEnv();
   const db = cfg.tgt.db;
+  const start = Date.now();
   const workdir = fs.mkdtempSync(path.join(os.tmpdir(), `snapmysql-restore-`));
+  log.info("R_START", { rid, db });
 
   try {
     const client = s3Client(cfg.s3);
@@ -35,24 +39,30 @@ export async function runRestore() {
     let backupKey = null;
     if (state?.latest_backup?.key) {
       backupKey = state.latest_backup.key;
+      log.info("R_STATE_OK", { rid, db, key: backupKey, md5: state.latest_backup.checksum?.value });
       const lastMd5 = state?.latest_restore?.checksum?.value || null;
       const newMd5  = state?.latest_backup?.checksum?.value || null;
       const skip = !!(newMd5 && lastMd5 && newMd5 === lastMd5);
       if (skip) {
-        log.info({ backupKey, md5: newMd5 }, "Restore skipped (checksum unchanged).");
+        log.info("R_SKIP_SAME", { rid, db, key: backupKey, md5: newMd5 });
         await notifySlack(cfg.slackWebhook, `⏭️ SnapMySQL restore skipped for *${db}* – latest backup MD5 matches last restored.`);
         return backupKey;
       }
     } else {
       const legacy = await getLatestKey({ client, bucket: cfg.s3.bucket, db: cfg.src.db });
-      if (!legacy) throw new Error(`No latest.json or latest.txt found for db ${cfg.src.db}`);
+      if (!legacy) {
+        log.warn("R_STATE_NONE", { rid, db: cfg.src.db, reason: "no-latest-state", action: "skip" });
+        await notifySlack(cfg.slackWebhook, `⏭️ SnapMySQL restore skipped for *${cfg.tgt.db}* – no latest backup state yet.`);
+        return null;
+      }
       backupKey = legacy;
     }
 
-    log.info({ latestKey: backupKey }, "Latest backup key resolved.");
+    log.info("R_KEY", { rid, db, key: backupKey });
     const tgzPath = path.join(workdir, "backup.tgz");
     await downloadS3ObjectToFile({ client, bucket: cfg.s3.bucket, key: backupKey, destPath: tgzPath });
-    log.info({ tgzPath }, "Downloaded backup.");
+    const bytes = (await fs.promises.stat(tgzPath)).size;
+    log.info("R_DOWNLOAD_OK", { rid, key: backupKey, bytes });
 
     // Verify checksum if state has one
     const computedMd5 = await fileMd5(tgzPath);
@@ -66,9 +76,13 @@ export async function runRestore() {
     const fullSqlGzPath = path.join(workdir, sqlGzPath);
 
     await killDbConnections({ conn: cfg.tgt, db });
+    log.info("R_KILL_OK", { rid, db });
     await dropAndRecreateDatabase({ conn: cfg.tgt, db });
+    log.info("R_DROPCREATE_OK", { rid, db });
 
+    const t0 = Date.now();
     await restoreFromSqlGz({ conn: cfg.tgt, db, sqlGzPath: fullSqlGzPath });
+    log.info("R_RESTORE_OK", { rid, db, dur_ms: Date.now() - t0 });
 
     // Update latest.json with latest_restore info (and bump restore counter)
     if (state) {
@@ -88,12 +102,15 @@ export async function runRestore() {
         updated_at: isoUtcNow()
       };
       await putJsonAtomic({ client, bucket: cfg.s3.bucket, key: latestJsonKey, json: newState });
+      log.info("R_STATE_OK", { rid, key: latestJsonKey });
     }
 
     await notifySlack(cfg.slackWebhook, `✅ SnapMySQL restore complete for *${db}*. Restored: \`${backupKey}\``);
+    log.info("SUMMARY", { rid, db, key: backupKey, md5: computedMd5, elapsed_ms: Date.now() - start, action: "restored" });
+    log.info("R_DONE", { rid, db, restored_key: backupKey, elapsed_ms: Date.now() - start });
     return backupKey;
   } catch (err) {
-    log.error({ err }, "Restore failed.");
+    log.error("R_FAIL", { rid, db, err: (err && err.message) || String(err) });
     await notifySlack(cfg.slackWebhook, `❌ SnapMySQL restore FAILED for *${cfg.tgt.db}*: ${String(err.message || err)}`);
     throw err;
   } finally {

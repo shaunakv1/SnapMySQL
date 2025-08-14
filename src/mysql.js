@@ -1,5 +1,4 @@
 import { execa } from "execa";
-import { log } from "./logger.js";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -25,82 +24,41 @@ export async function mysqldumpFull({ conn, db, outDir }) {
     "--set-gtid-purged=OFF",
     "--databases", db,
   ];
-
-  // Stream: mysqldump -> gzip -> file
   const dump = execa("mysqldump", args, { stdout: "pipe" });
   const gzip = execa("gzip", ["-c"], { input: dump.stdout, stdout: "pipe" });
-
   const writeStream = fs.createWriteStream(sqlGz);
   gzip.stdout.pipe(writeStream);
-
   await new Promise((resolve, reject) => {
     writeStream.on("finish", resolve);
     writeStream.on("error", reject);
   });
-
-  log.info({ sqlGz }, "Created gzipped dump.");
   return sqlGz;
 }
 
 export async function mysqlExecSql({ conn, sql }) {
-  const args = [
-    ...commonMyOpts(conn),
-    "-e", sql,
-  ];
+  const args = [ ...commonMyOpts(conn), "-e", sql ];
   await execa("mysql", args);
 }
 
 export async function killDbConnections({ conn, db }) {
-  const sql = `
-    SELECT CONCAT('KILL ', id, ';') AS cmd
-    FROM information_schema.PROCESSLIST
-    WHERE db='${db}';
-  `;
-  const args = [
-    ...commonMyOpts(conn),
-    "-N", "-e", sql,
-  ];
+  const sql = `SELECT CONCAT('KILL ', id, ';') AS cmd FROM information_schema.PROCESSLIST WHERE db='${db}';`;
+  const args = [ ...commonMyOpts(conn), "-N", "-e", sql ];
   const { stdout } = await execa("mysql", args);
   const cmds = stdout.split("\n").map(s => s.trim()).filter(Boolean);
-  if (cmds.length) {
-    await mysqlExecSql({ conn, sql: cmds.join("\n") });
-    log.info({ db }, `Killed ${cmds.length} connections.`);
-  } else {
-    log.info({ db }, "No connections to kill.");
-  }
+  if (cmds.length) await mysqlExecSql({ conn, sql: cmds.join("\n") });
 }
 
 export async function dropAndRecreateDatabase({ conn, db }) {
   await mysqlExecSql({ conn, sql: `DROP DATABASE IF EXISTS \`${db}\`; CREATE DATABASE \`${db}\`;` });
-  log.info({ db }, "Dropped and recreated target database.");
-}
-
-export async function listTables({ conn, db }) {
-  const args = [
-    ...commonMyOpts(conn),
-    "-N",
-    "-e",
-    `SELECT table_name FROM information_schema.tables WHERE table_schema='${db}';`,
-  ];
-  const { stdout } = await execa("mysql", args);
-  return stdout.split("\n").map(s => s.trim()).filter(Boolean);
 }
 
 export async function restoreFromSqlGz({ conn, db, sqlGzPath }) {
-  // gunzip -> mysql
   const gunzip = execa("gunzip", ["-c", sqlGzPath], { stdout: "pipe" });
-  const args = [
-    ...commonMyOpts(conn),
-  ];
+  const args = [ ...commonMyOpts(conn) ];
   const mysqlProc = execa("mysql", args, { input: gunzip.stdout });
   await mysqlProc;
-  log.info({ db }, "Restore completed.");
 }
 
-/**
- * Preferred inventory: separates BASE TABLES from VIEWS and returns
- * approximate row counts only for BASE TABLES. Views are tracked by name.
- */
 export async function tableInventory({ conn, db }) {
   const args = [
     ...commonMyOpts(conn),
@@ -111,8 +69,8 @@ export async function tableInventory({ conn, db }) {
      WHERE table_schema='${db}';`,
   ];
   const { stdout } = await execa("mysql", args);
-  const baseCounts = new Map(); // table -> approx row count
-  const views = new Set();      // view names
+  const baseCounts = new Map();
+  const views = new Set();
   stdout.split("\n").forEach(line => {
     if (!line) return;
     const [name, rowsStr, type] = line.split("\t");
