@@ -120,12 +120,8 @@ docker run --rm --env-file .env -e PAUSE_RESTORE=true snapmysql:local
 
 Once published, you can pull:
 ```bash
-docker pull ghcr.io/<YOUR_GITHUB_USER_OR_ORG>/snap_mysql:latest
+docker pull ghcr.io/shaunakv1/snapmysql:latest
 ```
-
-Use exactly as above, just swap `snapmysql:local` for
-`ghcr.io/<YOUR_GITHUB_USER_OR_ORG>/snap_mysql:<TAG>`.
-
 ---
 
 ### D) Docker-Compose Test Harness
