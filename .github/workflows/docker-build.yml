@@ -21,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       docker-tag:
-        description: "Docker tag"
+        description: "Docker tag (for manual runs)"
         default: ""
 
 concurrency:
@@ -32,60 +32,31 @@ permissions:
   contents: read
   packages: write
 
+env:
+  IMAGE: ghcr.io/shaunakv1/snapmysql
+  # Deterministic ephemeral tags (not preserved)
+  EPH_AMD64: build-${{ github.sha }}-amd64
+  EPH_ARM64: build-${{ github.sha }}-arm64
+
 jobs:
-  build-docker-image:
-    name: Build & Push (${{ matrix.platform }})
+  build:
+    name: Build (${{ matrix.platform }})
     strategy:
       matrix:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
-            archsuffix: amd64
+            eph: build-${{ github.sha }}-amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm   # or ubuntu-22.04-arm for public repos
-            archsuffix: arm64
+            eph: build-${{ github.sha }}-arm64
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - name: 📥 Checkout code
+      - name: 📥 Checkout
         uses: actions/checkout@v5
 
-      # Compute per-arch tags by adding a suffix via 'flavor'
-      - name: 🔖 Set image tags (per-arch)
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/shaunakv1/snapmysql
-          flavor: |
-            suffix=-${{ matrix.archsuffix }}
-          tags: |
-            # main → :latest
-            type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
-            # non-main branch push (not PR) → :{branch}-latest
-            type=raw,value={{branch}}-latest,enable=${{ github.ref_type == 'branch' && github.ref_name != 'main' && github.event_name != 'pull_request' }}
-            # manual override for workflow_dispatch
-            type=raw,value=${{ inputs.docker-tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.docker-tag != '' }}
-            # semver tags on tag pushes like v1.2.3
-            type=semver,pattern={{raw}}
-            # PR refs → :pr-<num>
-            type=ref,event=pr
-            # always add SHA tag on non-PR builds for traceability
-            type=sha,prefix={{branch}}-,priority=100,enable=${{ github.event_name != 'pull_request' }}
-
-      - name: 🔎 Show computed per-arch tags
-        run: |
-          echo "ARCH TAGS (should include -${{ matrix.archsuffix }}):"
-          printf "%s\n" "${{ steps.meta.outputs.tags }}"
-
-      - name: 🚧 Ensure per-arch tags are not empty
-        run: |
-          if [ -z "${{ steps.meta.outputs.tags }}" ]; then
-            echo "ERROR: No tags were generated for this event/branch." >&2
-            echo "Hint: Push to 'main', push a tag like v1.2.3, open a PR, or pass inputs.docker-tag on workflow_dispatch." >&2
-            exit 1
-          fi
-
-      - name: 🏗️ Set up Docker Buildx
+      - name: 🏗️ Setup Buildx
         uses: docker/setup-buildx-action@v3
         with:
           install: true
@@ -98,21 +69,24 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🐳 Build and Push (per-arch)
+      # Build natively for this arch and push under the ephemeral tag
+      - name: 🐳 Build & Push (ephemeral)
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: ${{ matrix.platform }}
           push: true
-          platforms: ${{ matrix.platform }}              # native arch only
-          tags: ${{ steps.meta.outputs.tags }}           # already suffixed by flavor
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ env.IMAGE }}:${{ matrix.eph }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.repository }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
 
-  publish-manifest:
-    name: Create Multi-Arch Manifests
+  publish:
+    name: Publish Multi-Arch Tags
     runs-on: ubuntu-latest
-    needs: [build-docker-image]
+    needs: [build]
 
     steps:
       - name: 🔐 Login to GHCR
@@ -122,64 +96,54 @@ jobs:
           username: ${{ github.repository_owner }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Compute the *base* tags (no suffix) for this event
-      - name: ♻️ Compute base tags (unsuffixed)
+      # Compute the final, user-facing tags (unsuffixed)
+      - name: 🔖 Compute final tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/shaunakv1/snapmysql
+          images: ${{ env.IMAGE }}
           tags: |
+            # main → :latest
             type=raw,value=latest,enable=${{ github.ref_name == 'main' }}
+            # non-main branch push (not PR) → :{branch}-latest
             type=raw,value={{branch}}-latest,enable=${{ github.ref_type == 'branch' && github.ref_name != 'main' && github.event_name != 'pull_request' }}
+            # manual override for workflow_dispatch
             type=raw,value=${{ inputs.docker-tag }},enable=${{ github.event_name == 'workflow_dispatch' && inputs.docker-tag != '' }}
+            # semver on tag pushes (vX.Y.Z)
             type=semver,pattern={{raw}}
+            # PR refs → :pr-<num> (remove if you don't want PR images public)
             type=ref,event=pr
+            # SHA tag on non-PR builds
             type=sha,prefix={{branch}}-,priority=100,enable=${{ github.event_name != 'pull_request' }}
 
-      - name: 🔎 Show base tags
+      - name: 🚧 Ensure there are tags to publish
         run: |
-          echo "BASE TAGS (unsuffixed):"
-          printf "%s\n" "${{ steps.meta.outputs.tags }}"
-
-      - name: 🧩 Create multi-arch manifests
-        shell: bash
-        run: |
-          set -euo pipefail
-          BASE_TAGS="${{ steps.meta.outputs.tags }}"
-          if [ -z "$BASE_TAGS" ]; then
-            echo "No base tags to publish; nothing to do."
-            exit 0
+          if [ -z "${{ steps.meta.outputs.tags }}" ]; then
+            echo "No publishable tags for this event; nothing to do." && exit 0
           fi
 
-          # We expect these two suffixed images from the build matrix:
-          ARCHES=("amd64" "arm64")
-
-          echo "Publishing multi-arch manifests..."
+      # Create the multi-arch manifest from the two ephemeral tags
+      - name: 🧩 Create multi-arch manifests
+        env:
+          IMAGE: ${{ env.IMAGE }}
+          REF_AMD64: ${{ env.IMAGE }}:${{ env.EPH_AMD64 }}
+          REF_ARM64: ${{ env.IMAGE }}:${{ env.EPH_ARM64 }}
+        run: |
+          set -euo pipefail
+          echo "Publishing multi-arch manifests:"
+          printf "%s\n" "${{ steps.meta.outputs.tags }}"
           echo
 
-          while IFS= read -r BASE; do
-            [ -z "$BASE" ] && continue
+          # Optional: verify ephemeral images exist before stitching
+          docker buildx imagetools inspect "$REF_AMD64" >/dev/null
+          docker buildx imagetools inspect "$REF_ARM64" >/dev/null
 
-            # Build ref list for the manifest (skip any missing)
-            REFS=()
-            for A in "${ARCHES[@]}"; do
-              REF="${BASE}-${A}"
-              # Verify existence to avoid hard failures if one arch is missing
-              if docker buildx imagetools inspect "$REF" > /dev/null 2>&1; then
-                REFS+=("$REF")
-              else
-                echo "WARN: Missing $REF — will publish manifest with available arches."
-              fi
-            done
-
-            if [ ${#REFS[@]} -eq 0 ]; then
-              echo "Skip $BASE: no arch images found."
-              continue
-            fi
-
-            echo "Creating manifest for: $BASE"
-            echo " -> refs: ${REFS[*]}"
-            docker buildx imagetools create --tag "$BASE" "${REFS[@]}"
-            docker buildx imagetools inspect "$BASE" || true
-            echo
-          done <<< "$BASE_TAGS"
+          while IFS= read -r FINAL; do
+            [ -z "$FINAL" ] && continue
+            echo " -> $FINAL"
+            docker buildx imagetools create \
+              --tag "$FINAL" \
+              "$REF_AMD64" \
+              "$REF_ARM64"
+            docker buildx imagetools inspect "$FINAL" || true
+          done <<< "${{ steps.meta.outputs.tags }}"
