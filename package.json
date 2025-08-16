@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "author": "Shaunak Vairagare <shaunakv1@gmail.com>",
   "type": "module",
-  "description": "MySQL backup & restore orchestrator for Kubernetes.",
+  "description": "MySQL backup & restore orchestrator for Kubernetes and Docker",
   "main": "src/main.js",
   "scripts": {
     "start": "node src/main.js",
