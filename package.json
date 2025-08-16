@@ -1,6 +1,7 @@
 {
   "name": "snapmysql",
   "version": "1.0.0",
+  "author": "Shaunak Vairagare",
   "type": "module",
   "description": "MySQL backup & restore orchestrator for Kubernetes.",
   "main": "src/main.js",
