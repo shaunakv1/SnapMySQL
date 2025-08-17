@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { cfg, requireEnv } from "./config.js";
+import { cfg, requireRestoreEnv } from "./config.js";
 import { mkLogger, newRid } from "./logger.js";
 import { s3Client, getLatestKey, getJson, putJsonAtomic } from "./s3.js";
 import { dropAndRecreateDatabase, killDbConnections, restoreFromSqlGz } from "./mysql.js";
@@ -38,7 +38,7 @@ async function downloadS3ObjectToFile({ client, bucket, key, destPath }) {
 }
 
 export async function runRestore(rid = newRid("r"), cliOpts = null) {
-  requireEnv();
+  requireRestoreEnv();
   const argvOpts = cliOpts || parseArgs(process.argv.slice(2));
   const manual = !!(argvOpts.file || argvOpts.key);
   const overrideDb = argvOpts.db || process.env.RESTORE_DB || cfg.tgt.db;
@@ -57,7 +57,6 @@ export async function runRestore(rid = newRid("r"), cliOpts = null) {
     let computedMd5 = null;
 
     if (argvOpts.file) {
-      // Local file restore (manual mode: bypass S3/state, do not update latest.json)
       const abs = path.isAbsolute(argvOpts.file) ? argvOpts.file : path.resolve(argvOpts.file);
       if (!fs.existsSync(abs)) throw new Error(`File not found: ${abs}`);
       tgzPath = abs;
@@ -65,7 +64,6 @@ export async function runRestore(rid = newRid("r"), cliOpts = null) {
       log.info("R_MANUAL_FILE", { rid, path: abs });
       computedMd5 = await fileMd5(tgzPath);
     } else if (argvOpts.key) {
-      // Specific S3 key restore (manual mode: do not read/update latest.json)
       backupKey = argvOpts.key;
       log.info("R_MANUAL_KEY", { rid, db, key: backupKey });
       await downloadS3ObjectToFile({ client, bucket: cfg.s3.bucket, key: backupKey, destPath: tgzPath });
@@ -73,7 +71,6 @@ export async function runRestore(rid = newRid("r"), cliOpts = null) {
       log.info("R_DOWNLOAD_OK", { rid, key: backupKey, bytes });
       computedMd5 = await fileMd5(tgzPath);
     } else {
-      // Normal flow: read latest.json (or legacy latest.txt) and apply checksum guard
       state = await getJson({ client, bucket: cfg.s3.bucket, key: latestJsonKey }).catch(() => null);
       if (state?.latest_backup?.key) {
         backupKey = state.latest_backup.key;
@@ -109,7 +106,6 @@ export async function runRestore(rid = newRid("r"), cliOpts = null) {
       }
     }
 
-    // Extract and restore
     await execa("tar", ["-xzf", tgzPath, "-C", workdir]);
     const sqlGzPath = fs.readdirSync(workdir).find(f => f.endsWith(".sql.gz"));
     if (!sqlGzPath) throw new Error("Extracted archive missing .sql.gz");
@@ -124,8 +120,6 @@ export async function runRestore(rid = newRid("r"), cliOpts = null) {
     await restoreFromSqlGz({ conn: cfg.tgt, db, sqlGzPath: fullSqlGzPath });
     log.info("R_RESTORE_OK", { rid, db, dur_ms: Date.now() - t0 });
 
-    // Normal mode: update latest.json to record the restore.
-    // Manual mode (--file/--key): SKIP updating latest.json per design.
     if (!manual) {
       try {
         const st = state || {};
@@ -141,7 +135,7 @@ export async function runRestore(rid = newRid("r"), cliOpts = null) {
             key: backupKey,
             restored_at: isoUtcNow(),
             target: { host: cfg.tgt.host, port: cfg.tgt.port },
-            checksum: { algo: "md5", value: computedMd5 }
+            checksum: { algo: "md5", value: (await fileMd5(tgzPath)) }
           },
           stats: {
             backups_total: st?.stats?.backups_total || 0,
@@ -149,6 +143,7 @@ export async function runRestore(rid = newRid("r"), cliOpts = null) {
           },
           updated_at: isoUtcNow()
         };
+        const latestJsonKey = `${cfg.src.db}/latest.json`;
         await putJsonAtomic({ client, bucket: cfg.s3.bucket, key: latestJsonKey, json: newState });
         log.info("R_STATE_OK", { rid, key: latestJsonKey });
       } catch {}
@@ -156,8 +151,8 @@ export async function runRestore(rid = newRid("r"), cliOpts = null) {
       log.info("R_STATE_SKIP", { rid, reason: "manual" });
     }
 
-    await notifySlack(cfg.slackWebhook, `✅ SnapMySQL restore complete for *${db}*. Restored: \`${backupKey}\``, rid);
-    log.info("SUMMARY", { rid, db, key: backupKey, md5: computedMd5, elapsed_ms: Date.now() - start, action: "restored" });
+    await notifySlack(cfg.slackWebhook, `✅ SnapMySQL restore complete for *${db}*.`, rid);
+    log.info("SUMMARY", { rid, db, key: backupKey, elapsed_ms: Date.now() - start, action: "restored" });
     log.info("R_DONE", { rid, db, restored_key: backupKey, elapsed_ms: Date.now() - start });
     return backupKey;
   } catch (err) {

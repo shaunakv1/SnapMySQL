@@ -69,7 +69,7 @@ node mysql-db-backups/src/main.js
 
 Build:
 ```bash
-docker build -t snapmysql:local -f mysql-db-backups/Dockerfile .
+docker build -t snapmysql:local .
 ```
 
 Run one-off **backup**:
