@@ -1,78 +1,70 @@
 import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
-import fs from "node:fs";
+import { mkLogger } from "./logger.js";
 
-export function s3Client(cfg) {
+const log = mkLogger("s3");
+
+export function s3Client(s3cfg) {
+  const endpoint = s3cfg.endpoint;
+  const isMinio = typeof endpoint === "string" && /minio|localhost|127\.0\.0\.1/i.test(endpoint);
   return new S3Client({
-    region: cfg.region,
-    endpoint: cfg.endpoint,
-    forcePathStyle: true,
+    region: s3cfg.region,
+    endpoint,
+    forcePathStyle: isMinio,
     credentials: {
-      accessKeyId: cfg.accessKeyId,
-      secretAccessKey: cfg.secretAccessKey
+      accessKeyId: s3cfg.accessKeyId,
+      secretAccessKey: s3cfg.secretAccessKey
     }
   });
 }
 
-export async function uploadFile({ client, bucket, key, filePath, contentType="application/octet-stream" }) {
-  await client.send(new PutObjectCommand({
-    Bucket: bucket,
-    Key: key,
-    Body: fs.createReadStream(filePath),
-    ContentType: contentType
-  }));
+async function streamToBuffer(stream) {
+  const chunks = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
 }
 
-export async function putText({ client, bucket, key, text, contentType="text/plain" }) {
-  const body = Buffer.from(text, "utf8");
-  await client.send(new PutObjectCommand({
-    Bucket: bucket,
-    Key: key,
-    Body: body,
-    ContentType: contentType,
-    ContentLength: body.length,
-    CacheControl: "no-cache"
-  }));
+export async function putObject({ client, bucket, key, body, contentType }) {
+  await client.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: contentType }));
+  return { bucket, key };
+}
+
+export async function getJson({ client, bucket, key }) {
+  const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const buf = await streamToBuffer(res.Body);
+  return JSON.parse(buf.toString("utf8"));
+}
+
+export async function getText({ client, bucket, key }) {
+  const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+  const buf = await streamToBuffer(res.Body);
+  return buf.toString("utf8");
 }
 
 export async function putJsonAtomic({ client, bucket, key, json }) {
   const tmpKey = key + ".tmp";
   const body = Buffer.from(JSON.stringify(json, null, 2), "utf8");
-  const put = async (k) => client.send(new PutObjectCommand({
-    Bucket: bucket,
-    Key: k,
-    Body: body,
-    ContentType: "application/json",
-    ContentLength: body.length,
-    CacheControl: "no-cache"
-  }));
-  await put(tmpKey);
-  await put(key);
-}
-
-export async function getText({ client, bucket, key }) {
-  const res = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-  const text = await res.Body.transformToString();
-  return text;
-}
-
-export async function getJson({ client, bucket, key }) {
-  const txt = await getText({ client, bucket, key });
-  return JSON.parse(txt);
+  await putObject({ client, bucket, key: tmpKey, body, contentType: "application/json" });
+  await putObject({ client, bucket, key, body, contentType: "application/json" });
+  return { bucket, key };
 }
 
 export async function getLatestKey({ client, bucket, db }) {
-  // legacy support for latest.txt
-  const key = `${db}/latest.txt`;
-  const txt = await getText({ client, bucket, key }).catch(() => null);
-  if (!txt) return null;
-  return txt.trim();
-}
-
-export async function listBackups({ client, bucket, db, maxKeys=10 }) {
-  const res = await client.send(new ListObjectsV2Command({
-    Bucket: bucket,
-    Prefix: `${db}/`,
-    MaxKeys: maxKeys
-  }));
-  return (res.Contents || []).map(o => o.Key).filter(k => k.endsWith(".tgz")).sort();
+  const jsonKey = `${db}/latest.json`;
+  try {
+    const st = await getJson({ client, bucket, key: jsonKey });
+    if (st?.latest_backup?.key) return st.latest_backup.key;
+  } catch {}
+  const txtKey = `${db}/latest.txt`;
+  try {
+    const s = await getText({ client, bucket, key: txtKey });
+    const trimmed = s.trim();
+    if (trimmed) return trimmed;
+  } catch {}
+  const resp = await client.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: `${db}/` }));
+  if (!resp.Contents || resp.Contents.length === 0) return null;
+  const candidates = resp.Contents.map(o => o.Key).filter(k => k && /\.tgz$/.test(k));
+  candidates.sort();
+  return candidates[candidates.length - 1] || null;
 }

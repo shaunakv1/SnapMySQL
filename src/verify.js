@@ -8,20 +8,18 @@ export async function verifySourceVsTarget(rid = newRid("v")) {
   const src = await tableInventory({ conn: cfg.src, db: cfg.src.db });
   const tgt = await tableInventory({ conn: cfg.tgt, db: cfg.tgt.db });
 
-  // Presence check across both base tables and views.
   const srcObjects = new Set([...src.baseCounts.keys(), ...src.views]);
   const tgtObjects = new Set([...tgt.baseCounts.keys(), ...tgt.views]);
 
   const missingInTgt = [...srcObjects].filter(x => !tgtObjects.has(x));
   const extraInTgt   = [...tgtObjects].filter(x => !srcObjects.has(x));
 
-  // Row-count diffs only for BASE TABLES (skip views).
   const diffs = [];
-  for (const t of src.baseCounts.keys()) {
-    const a = src.baseCounts.get(t);
-    const b = tgt.baseCounts.get(t);
-    if (b === undefined) continue; // handled by presence check
-    if (a !== b) diffs.push({ table: t, src: a, tgt: b });
+  for (const [tbl, srcCount] of src.baseCounts.entries()) {
+    const tgtCount = tgt.baseCounts.get(tbl);
+    if (tgtCount !== undefined && srcCount !== tgtCount) {
+      diffs.push({ table: tbl, src: srcCount, tgt: tgtCount });
+    }
   }
 
   const ok = !(missingInTgt.length || extraInTgt.length || diffs.length);

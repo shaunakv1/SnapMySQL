@@ -19,11 +19,10 @@ const SKIP_CRON = /^(1|true|yes)$/i.test(process.env.SKIP_CRON || "");
 const RUN_IMMEDIATELY_RAW = (process.env.RUN_IMMEDIATELY || "").toLowerCase();
 const RUN_IMMEDIATELY_BOOL = /^(1|true|yes)$/i.test(process.env.RUN_IMMEDIATELY || "");
 
-// Immediate locks to prevent overlap with themselves
+// Prevent overlapping runs
 let backupRunning = false;
 let restoreRunning = false;
 
-// Also used by cron to prevent overlap across ticks
 async function runBackupLocked(trigger = "cron") {
   if (backupRunning) { log.warn("B_SKIP_BUSY", { trigger }); return; }
   backupRunning = true;
@@ -40,7 +39,7 @@ async function runRestoreLocked(trigger = "cron") {
   finally { restoreRunning = false; }
 }
 
-// Derive allowed tasks from ROLE
+// Allowed tasks derived from ROLE
 const allowed = new Set(ROLE === "both" ? ["backup","restore"] : [ROLE]);
 
 function parseImmediateSet() {
@@ -48,13 +47,11 @@ function parseImmediateSet() {
   if (RUN_IMMEDIATELY_BOOL) return new Set(allowed); // respect ROLE
   if (RUN_IMMEDIATELY_RAW === "both") return new Set(["backup","restore"]);
   if (RUN_IMMEDIATELY_RAW === "backup" || RUN_IMMEDIATELY_RAW === "restore") return new Set([RUN_IMMEDIATELY_RAW]);
-  return new Set(); // any other value = ignore
+  return new Set(); // ignore unknown
 }
 
 const requestedImmediate = parseImmediateSet();
-// Final immediate set is intersection(requested, allowed)
 const immediateToRun = new Set([...requestedImmediate].filter(x => allowed.has(x)));
-// Log any requested but disallowed by ROLE
 for (const x of requestedImmediate) {
   if (!allowed.has(x)) log.warn("IMMEDIATE_SKIP_ROLE", { requested: x, role: ROLE });
 }
@@ -70,7 +67,7 @@ log.info("SCHED_START", {
   run_immediately: RUN_IMMEDIATELY_RAW || (RUN_IMMEDIATELY_BOOL ? "role" : "")
 });
 
-// Immediate runs at startup (respecting ROLE)
+// Immediate runs at startup (respect ROLE)
 if (immediateToRun.has("backup")) runBackupLocked("immediate");
 if (immediateToRun.has("restore")) runRestoreLocked("immediate");
 
