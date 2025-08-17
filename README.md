@@ -17,14 +17,14 @@ It takes a complete dump (data + schema + routines + events + triggers) from a *
 - 🧪 **Local harness**: docker-compose with seeded source DB and MinIO
 - 🔕 **Clean logs**: one-line, grep-friendly event codes
 - 🔔 **Slack notifications** (optional)
-- 🧰 **Manual restore modes**: restore a specific `--file` or S3 `--key` without touching scheduler state
-- 🧯 **Ops controls**: split roles into separate pods/containers and pause with env flags
+- 🧰 **Manual immediate runs** via `ROLE` + `RUN_IMMEDIATELY` (without waiting for cron)
+- 🧯 **Ops controls**: split roles into separate pods/containers; pause streams with env flags
 
 ---
 
 ## Quick Start
 
-> You can run SnapMySQL in **manual mode** (single shot) or as a **scheduler** (crons). Choose your setup below.
+> SnapMySQL can run as a **scheduler** (cron-driven) or in **manual/one-shot** mode using `ROLE` + `RUN_IMMEDIATELY`. Examples below use **`src/main.js`** (preferred) rather than calling sub-scripts directly.
 
 ### A) Manual mode (Node.js on your machine)
 
@@ -32,36 +32,29 @@ Requirements:
 - Node.js 20+
 - `mysql` & `mysqldump` on PATH (or use the Docker method below)
 
-1) Clone the repo and set environment variables (see **Environment** below).
+1) Set environment variables (see **Environment**).
 
-2) Run a **one-off backup**:
+2) Run a **one-off backup now** (no cron):
 ```bash
-node mysql-db-backups/src/backup.js
+ROLE=backup RUN_IMMEDIATELY=true SKIP_CRON=true node mysql-db-backups/src/main.js
 ```
 
-3) Run a **one-off restore** (normal latest):
+3) Run a **one-off restore of the latest backup**:
 ```bash
-node mysql-db-backups/src/restore.js
+ROLE=restore RUN_IMMEDIATELY=true SKIP_CRON=true node mysql-db-backups/src/main.js
 ```
 
-4) **Manual restore** from a specific file or S3 key (does **not** update `latest.json`):
+4) Restore into a **different database name** (manual latest):
 ```bash
-# local tarball
-node mysql-db-backups/src/restore.js --file /path/to/mydb-2025-08-13T03:15:00Z.tgz
-
-# specific object key in S3/Spaces
-node mysql-db-backups/src/restore.js --key mydb/2025-08-13T03:15:00Z.tgz
-
-# restore into a different database name
-node mysql-db-backups/src/restore.js --file /path/to/backup.tgz --db mydb_staging
-# or via env
-RESTORE_DB=mydb_staging node mysql-db-backups/src/restore.js
+ROLE=restore RUN_IMMEDIATELY=true SKIP_CRON=true RESTORE_DB=mydb_staging node mysql-db-backups/src/main.js
 ```
 
-5) Run the **scheduler** (both backup & restore crons):
+5) Run the **scheduler** (both cron streams enabled):
 ```bash
-node mysql-db-backups/src/main.js
+ROLE=both node mysql-db-backups/src/main.js
 ```
+
+> Want to restore a **specific artifact** by key or file path? That’s supported via the restore CLI (e.g., `src/restore.js --key ...` or `--file ...`) and does **not** modify `latest.json`. Using `main.js` for targeted artifacts is on the roadmap (e.g., envs like `RESTORE_KEY/RESTORE_FILE`).
 
 ---
 
@@ -72,30 +65,25 @@ Build:
 docker build -t snapmysql:local .
 ```
 
-Run one-off **backup**:
+Run **one-off backup** (no cron):
 ```bash
-docker run --rm --env-file .env snapmysql:local node src/backup.js
+docker run --rm --env-file .env \
+  -e ROLE=backup -e RUN_IMMEDIATELY=true -e SKIP_CRON=true \
+  snapmysql:local
 ```
 
-Run one-off **restore** (latest):
+Run **one-off restore (latest)**:
 ```bash
-docker run --rm --env-file .env snapmysql:local node src/restore.js
-```
-
-**Manual restore** with flags:
-```bash
-# local tarball mounted into /backup
-docker run --rm --env-file .env -v /path/to:/backup snapmysql:local \
-  node src/restore.js --file /backup/mydb-2025-08-13T03:15:00Z.tgz
-
-# specific S3 key
-docker run --rm --env-file .env snapmysql:local \
-  node src/restore.js --key mydb/2025-08-13T03:15:00Z.tgz
+docker run --rm --env-file .env \
+  -e ROLE=restore -e RUN_IMMEDIATELY=true -e SKIP_CRON=true \
+  snapmysql:local
 ```
 
 Run **scheduler** (both crons):
 ```bash
-docker run --rm --env-file .env snapmysql:local
+docker run --rm --env-file .env \
+  -e ROLE=both \
+  snapmysql:local
 ```
 
 Split roles into two containers:
@@ -109,9 +97,9 @@ docker run --rm --env-file .env -e ROLE=restore snapmysql:local
 Pause at runtime:
 ```bash
 # skip backup ticks
-docker run --rm --env-file .env -e PAUSE_BACKUP=true snapmysql:local
+docker run --rm --env-file .env -e ROLE=backup -e PAUSE_BACKUP=true snapmysql:local
 # skip restore ticks
-docker run --rm --env-file .env -e PAUSE_RESTORE=true snapmysql:local
+docker run --rm --env-file .env -e ROLE=restore -e PAUSE_RESTORE=true snapmysql:local
 ```
 
 ---
@@ -122,11 +110,13 @@ Once published, you can pull:
 ```bash
 docker pull ghcr.io/shaunakv1/snapmysql:latest
 ```
+(Usage is identical to the local image above.)
+
 ---
 
 ### D) Docker-Compose Test Harness
 
-This repo includes a **test profile** that launches:
+The repo includes a **test** profile that launches:
 - `src-mysql` (seeded with users/orders, routines, views, triggers, events)
 - `tgt-mysql`
 - `minio` (S3-compatible store)
@@ -152,15 +142,18 @@ Bucket: `my-mysql-backups`
 
 ## Environment Variables
 
-> These are read by SnapMySQL at runtime (Node or Docker). Put them in your `.env`.
+> Place these in your `.env` or export them before launching.  
+> **Do not put comments on the same line** as cron expressions — `node-cron` treats them as part of the pattern.
 
 ### Source DB (what you back up)
 ```
-SRC_DB_HOST=src-mysql         # or your RDS host
+SRC_DB_HOST=src-mysql                   # or your RDS host
 SRC_DB_PORT=3306
 SRC_DB_USER=root
-SRC_DB_PASS=srcpassword
+SRC_DB_PASSWORD=srcpassword
 SRC_DB_NAME=mydb
+# Optional MySQL client SSL behavior (only if needed for your provider)
+# SRC_DB_SSL_MODE=REQUIRED              # DISABLED | PREFERRED | REQUIRED | VERIFY_CA | VERIFY_IDENTITY
 ```
 
 ### Target DB (where you restore)
@@ -168,74 +161,88 @@ SRC_DB_NAME=mydb
 TGT_DB_HOST=tgt-mysql
 TGT_DB_PORT=3306
 TGT_DB_USER=root
-TGT_DB_PASS=tgtpassword
+TGT_DB_PASSWORD=tgtpassword
 TGT_DB_NAME=mydb
+# Optional MySQL client SSL behavior (only if needed)
+# TGT_DB_SSL_MODE=REQUIRED
 ```
 
 ### S3 / Spaces
 ```
-S3_ENDPOINT=http://minio:9000       # e.g., https://nyc3.digitaloceanspaces.com
-S3_REGION=us-east-1                 # region value (Spaces accepts any)
+S3_ENDPOINT=http://minio:9000          # e.g., https://nyc3.digitaloceanspaces.com
+S3_REGION=us-east-1                    # Spaces accepts any region value
 S3_ACCESS_KEY_ID=xxxxxxxx
 S3_SECRET_ACCESS_KEY=xxxxxxxx
 S3_BUCKET=my-mysql-backups
 ```
 
-### Scheduler
+### Scheduler & Roles
 ```
-CRON_BACKUP=*/10 * * * *     # when to run backups
-CRON_RESTORE=*/15 * * * *    # when to run restores
-CRON_TZ=UTC                  # timezone for node-cron
-ROLE=both                    # backup | restore | both
-PAUSE_BACKUP=false           # true|1|yes to skip the tick
-PAUSE_RESTORE=false          # true|1|yes to skip the tick
+ROLE=both                               # backup | restore | both
+CRON_BACKUP=*/10 * * * *                # backup cron
+CRON_RESTORE=*/15 * * * *               # restore cron
+CRON_TZ=UTC                             # timezone for node-cron
+
+# Operational controls
+PAUSE_BACKUP=false                      # true|1|yes to skip backup ticks
+PAUSE_RESTORE=false                     # true|1|yes to skip restore ticks
+SKIP_CRON=false                         # true to disable scheduler entirely (useful for manual runs)
+RUN_IMMEDIATELY=false                   # true to execute the ROLE task(s) now (once) without waiting
 ```
 
 ### Notifications & Logging
 ```
-SLACK_WEBHOOK_URL=           # optional; if unset, notifications are skipped
-LOG_STACK=false              # true to print stack traces on ERROR
+SLACK_WEBHOOK_URL=                      # optional; if unset, notifications are skipped
+LOG_LEVEL=info                          # trace|debug|info|warn|error
+LOG_STACK=false                         # true to print stack traces on ERROR
 ```
 
 ### Advanced
 ```
-RESTORE_DB=                  # override target db name for manual restore or CLI --db
-KEEP_LOCAL_WORKDIR=false     # if true, keeps temp working dir (debugging)
+RESTORE_DB=                             # override target DB name for a restore (manual/latest)
+KEEP_LOCAL_WORKDIR=false                # true → keep temp working dir for debugging
 ```
 
-> **Note:** SnapMySQL shells out to `mysqldump` and `mysql` and passes passwords via `-p...`. If this is a concern in your environment, switch to ephemeral `MYSQL_PWD` or ensure container isolation and restricted logs.
+> **Security note:** SnapMySQL shells out to `mysqldump` and `mysql` and passes passwords via `-p...`. If this is a concern, consider ephemeral `MYSQL_PWD` inside the container, ensure container isolation, and restrict logs.
 
 ---
 
 ## Architecture
 
 ### Backup flow
-1. **Dump:** `mysqldump --single-transaction --routines --events --triggers --hex-blob --set-gtid-purged=OFF --databases <db>`
-2. **Compress:** stream → `gzip`; **package:** `tar.gz` with a small `manifest.json`
+1. **Dump:** `mysqldump --single-transaction --routines --events --triggers --hex-blob --set-gtid-purged=OFF --databases <db>` (streamed → gzip)
+2. **Package:** tarball `mydb-<ISO8601>.tgz` (includes `mydb.sql.gz` and a tiny `manifest.json`)
 3. **Checksum:** compute file MD5
-4. **Upload:** to `s3://<bucket>/<db>/<ISO8601>.tgz`
+4. **Upload:** `s3://<bucket>/<db>/<ISO8601>.tgz`
 5. **State:** atomically write `<db>/latest.json` (see below)
 6. **Notify:** Slack (optional)
 
 ### Restore flow (scheduled)
-1. **Read state:** `<db>/latest.json`  
-2. **Guard:** if `latest_backup.md5` equals `latest_restore.md5`, **skip**
+1. **Read state:** `<db>/latest.json`
+2. **Guard:** if `latest_backup.checksum.value` equals `latest_restore.checksum.value`, **skip**
 3. **Download & verify MD5**
 4. **Kill connections → drop & recreate target DB**
-5. **Restore:** `mysql < dump.sql`
+5. **Restore:** stream `gunzip → mysql`
 6. **State:** update `latest.json.latest_restore`
 7. **Notify & Verify:** optional verification (rowcount + object presence), Slack (optional)
 
-### Restore flow (manual)
-- `--file` or `--key` **does not update** `latest.json` (by design)
-- You can also target a different DB via `--db` or `RESTORE_DB`
+### Restore flow (manual immediate via `main.js`)
+- Use `ROLE=restore RUN_IMMEDIATELY=true SKIP_CRON=true` to restore the **latest**.
+- Set `RESTORE_DB` to target a different DB name.
+- Manual latest restores **do update** `latest.json.latest_restore` *only if* they are part of the scheduled mode. Manual targeted artifacts (below) **do not** modify state.
+
+### Targeted artifact restore (advanced)
+- Restoring a specific S3 key or local tarball is supported via the restore CLI:  
+  `src/restore.js --key <db/YYYY-MM-DDTHH:MM:SSZ.tgz>` or `--file /path/to.tgz`  
+  This **does not** modify `latest.json` by design.
 
 ### Logging
 Single-line, grep-friendly events, e.g.:
 ```
-2025-08-13 03:20:00Z [INFO]  backup  B_TGZ_DONE       rid=b2 db=mydb key=mydb/2025-08-13T03:20:00Z.tgz
-2025-08-13 03:20:00Z [INFO]  restore R_RESTORE_OK     rid=r2 db=mydb dur_ms=1234
-2025-08-13 03:20:00Z [INFO]  restore SUMMARY          rid=r2 db=mydb key=... action=restored verify=ok elapsed_ms=...
+2025-08-13 03:20:00Z [INFO ] main    SCHED_START       role=both backup=*/10 * * * * restore=*/15 * * * * tz=UTC
+2025-08-13 03:20:00Z [INFO ] backup  B_TGZ_DONE        rid=b2 db=mydb key=mydb/2025-08-13T03:20:00Z.tgz size=123456 md5=abc...
+2025-08-13 03:20:00Z [INFO ] restore R_RESTORE_OK      rid=r2 db=mydb dur_ms=1234
+2025-08-13 03:20:00Z [INFO ] restore SUMMARY           rid=r2 db=mydb key=... action=restored verify=ok elapsed_ms=...
 ```
 
 ---
@@ -243,7 +250,7 @@ Single-line, grep-friendly events, e.g.:
 ## `latest.json` — the state file
 
 Path: `s3://<bucket>/<db>/latest.json`  
-Updated **after each backup** and **after each scheduled restore** (not manual).
+Updated **after each backup** and **after each scheduled restore**. Targeted manual restores (specific `--key/--file`) **do not** update state.
 
 Example:
 ```json
@@ -274,8 +281,7 @@ Example:
 Behavior:
 - **Backups** always update `latest_backup` and bump `stats.backups_total`.
 - **Scheduled restores** update `latest_restore` and bump `stats.restores_total`.
-- **Manual restores** (`--file`/`--key`) **do not** modify `latest.json`.  
-  This prevents accidental interaction with the scheduler.
+- **Manual targeted restores** (`--file`/`--key`) **do not** modify `latest.json`.
 
 Atomicity:
 - State writes use a two-step put: write `latest.json.tmp` then `latest.json`.
@@ -301,6 +307,7 @@ env:
     value: "*/10 * * * *"
   - name: CRON_TZ
     value: "UTC"
+
 # snapmysql-restore
 env:
   - name: ROLE
@@ -338,6 +345,6 @@ MIT — see `LICENSE`.
 
 ## Why not logical replication or binlog sync?
 
-Those are great for certain use cases, but they’re operationally heavier and less portable across providers. SnapMySQL aims to be the **90% solution**: easy to run anywhere, predictable, and fast to recover with artifacts you can hold onto (tarballs in object storage).
+Those are great for some use cases, but they’re operationally heavier and less portable across providers. SnapMySQL targets the **90% solution**: easy to run anywhere, predictable, and fast to recover with artifacts you can hold onto (tarballs in object storage).
 
 If you need point-in-time recovery or low-lag replicas, consider adding binlog archiving or using your cloud’s native tools **alongside** SnapMySQL.
