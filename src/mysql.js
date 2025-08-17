@@ -10,12 +10,36 @@ import { mkLogger } from "./logger.js";
 
 const log = mkLogger("mysql");
 
-function buildMysqlArgs(conn) {
+function resolvePassword(conn = {}) {
+  // Support several field names + env fallbacks to be resilient to config drift
+  const direct =
+    conn.password ?? conn.pass ?? conn.pwd ?? conn.PASSWORD ?? conn.secret ?? null;
+
+  if (direct) return String(direct);
+
+  // Fallback to env if available (prefers SRC for backup paths, TGT for restore paths)
+  const envGuess =
+    process.env.SRC_DB_PASSWORD ||
+    process.env.TGT_DB_PASSWORD ||
+    process.env.DB_PASSWORD ||
+    null;
+
+  return envGuess ? String(envGuess) : null;
+}
+
+function buildMysqlArgs(conn = {}) {
   const args = [];
   if (conn.host) args.push("-h", conn.host);
   if (conn.port) args.push("-P", String(conn.port));
   if (conn.user) args.push("-u", conn.user);
-  if (conn.password) args.push(`-p${conn.password}`);
+
+  const pw = resolvePassword(conn);
+  if (pw) {
+    // long form is robust and avoids `-p` prompt ambiguity
+    args.push(`--password=${pw}`);
+  }
+
+  // Keep TCP to avoid socket surprises in containerized envs
   args.push("--protocol=TCP");
   return args;
 }
@@ -46,7 +70,7 @@ export async function mysqldumpFull({ conn, db, outFile }) {
     const gzip = createGzip();
     const out = createWriteStream(outFile);
     const child = spawn("mysqldump", dumpArgs, {
-      stdio: ["ignore", "pipe", "inherit"], // pipe stdout to gzip
+      stdio: ["ignore", "pipe", "inherit"],
     });
 
     let finished = false;
@@ -79,7 +103,8 @@ export async function mysqldumpFull({ conn, db, outFile }) {
   });
 
   const stat = await fs.stat(outFile);
-  log.info("DUMP_DONE", { outFile, bytes: stat.size });
+  // Don't leak secrets: never print full args. Just minimal signal.
+  log.info("DUMP_DONE", { outFile, bytes: stat.size, host: conn?.host, db });
   return outFile;
 }
 
@@ -119,7 +144,7 @@ export async function restoreFromSqlGz({ conn, db, sqlGz }) {
     });
   });
 
-  log.info("RESTORE_STREAM_DONE", { sqlGz, db });
+  log.info("RESTORE_STREAM_DONE", { sqlGz, db, host: conn?.host });
 }
 
 export async function mysqlExecSql(conn, sql) {
