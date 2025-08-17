@@ -6,7 +6,9 @@ import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { createGzip, createGunzip } from "node:zlib";
 import { execa } from "execa";
-import { log } from "./logger.js";
+import { mkLogger } from "./logger.js";
+
+const log = mkLogger("mysql");
 
 function buildMysqlArgs(conn) {
   const args = [];
@@ -44,14 +46,13 @@ export async function mysqldumpFull({ conn, db, outFile }) {
     const gzip = createGzip();
     const out = createWriteStream(outFile);
     const child = spawn("mysqldump", dumpArgs, {
-      stdio: ["ignore", "pipe", "inherit"], // don't buffer stdout; we consume it
+      stdio: ["ignore", "pipe", "inherit"], // pipe stdout to gzip
     });
 
     let finished = false;
     const fail = (err) => {
       if (finished) return;
       finished = true;
-      // Best-effort kill
       try { child.kill("SIGKILL"); } catch {}
       reject(err);
     };
@@ -69,7 +70,6 @@ export async function mysqldumpFull({ conn, db, outFile }) {
 
     child.on("close", (code) => {
       if (code === 0) {
-        // wait for file stream to finish flushing
         out.on("close", ok);
         out.end();
       } else {
