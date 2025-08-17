@@ -1,115 +1,180 @@
-import { execa } from "execa";
-import fs from "node:fs";
-import path from "node:path";
 
-/** Build common MySQL CLI options */
-function commonMyOpts({ host, port, user, pass }) {
-  const opts = ["-h", host, "-P", String(port), "-u", user, `-p${pass}`, "--protocol=TCP"];
-  return opts;
+// src/mysql.js
+import { spawn } from "node:child_process";
+import { createWriteStream, createReadStream, promises as fs } from "node:fs";
+import { dirname } from "node:path";
+import { mkdir } from "node:fs/promises";
+import { createGzip, createGunzip } from "node:zlib";
+import { execa } from "execa";
+import { log } from "./logger.js";
+
+function buildMysqlArgs(conn) {
+  const args = [];
+  if (conn.host) args.push("-h", conn.host);
+  if (conn.port) args.push("-P", String(conn.port));
+  if (conn.user) args.push("-u", conn.user);
+  if (conn.password) args.push(`-p${conn.password}`);
+  args.push("--protocol=TCP");
+  return args;
 }
 
 /**
- * Create a full logical dump and gzip it to `outFile`.
- * Flags:
- *  --single-transaction --routines --events --triggers --hex-blob --set-gtid-purged=OFF --databases <db>
+ * Stream mysqldump -> gzip -> outFile without buffering in Node.
+ * Avoids execa's default 100MB maxBuffer.
  */
 export async function mysqldumpFull({ conn, db, outFile }) {
+  if (!db) throw new Error("mysqldumpFull: db is required");
   if (!outFile) throw new Error("mysqldumpFull: outFile is required");
+
+  await mkdir(dirname(outFile), { recursive: true });
+
   const dumpArgs = [
-    ...commonMyOpts(conn),
+    ...buildMysqlArgs(conn),
     "--single-transaction",
     "--routines",
     "--events",
     "--triggers",
     "--hex-blob",
     "--set-gtid-purged=OFF",
-    "--databases", db
+    "--databases",
+    db,
   ];
 
-  // Pipe mysqldump -> gzip -> file (no shell redirection)
-  const gzip = execa("gzip", ["-c"], { stdout: "pipe", stdin: "pipe" });
-  const dump = execa("mysqldump", dumpArgs, { stdout: "pipe" });
+  await new Promise((resolve, reject) => {
+    const gzip = createGzip();
+    const out = createWriteStream(outFile);
+    const child = spawn("mysqldump", dumpArgs, {
+      stdio: ["ignore", "pipe", "inherit"], // don't buffer stdout; we consume it
+    });
 
-  // Create the output write stream
-  await fs.promises.mkdir(path.dirname(outFile), { recursive: true });
-  const out = fs.createWriteStream(outFile);
+    let finished = false;
+    const fail = (err) => {
+      if (finished) return;
+      finished = true;
+      // Best-effort kill
+      try { child.kill("SIGKILL"); } catch {}
+      reject(err);
+    };
+    const ok = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
 
-  // Wire streams
-  dump.stdout.pipe(gzip.stdin);
-  gzip.stdout.pipe(out);
+    child.on("error", fail);
+    out.on("error", fail);
+    gzip.on("error", fail);
 
-  // Await completion
-  await Promise.all([dump, new Promise((res, rej) => { out.on("finish", res); out.on("error", rej); }) , gzip]);
+    child.stdout.pipe(gzip).pipe(out);
+
+    child.on("close", (code) => {
+      if (code === 0) {
+        // wait for file stream to finish flushing
+        out.on("close", ok);
+        out.end();
+      } else {
+        fail(new Error(`mysqldump exited with code ${code}`));
+      }
+    });
+  });
+
+  const stat = await fs.stat(outFile);
+  log.info("DUMP_DONE", { outFile, bytes: stat.size });
   return outFile;
 }
 
-/** Execute arbitrary SQL against a server (no DB required). */
-async function mysqlExecSql({ conn, sql }) {
-  const args = [...commonMyOpts(conn)];
-  const child = execa("mysql", args, { input: sql });
-  await child;
-}
+export async function restoreFromSqlGz({ conn, db, sqlGz }) {
+  if (!db) throw new Error("restoreFromSqlGz: db is required");
+  if (!sqlGz) throw new Error("restoreFromSqlGz: sqlGz is required");
 
-/** Kill all sessions connected to `db` (except our connection). */
-export async function killDbConnections({ conn, db }) {
-  const sql = `
-    SET @me = CONNECTION_ID();
-    SELECT CONCAT('KILL ', ID, ';') AS k
-      FROM information_schema.PROCESSLIST
-      WHERE db = '${db}' AND ID <> @me;
-  `;
-  // Fetch IDs then kill in a second call to avoid issues with multi-statements disabled
-  const args = [...commonMyOpts(conn), "-N", "-e", sql];
-  const { stdout } = await execa("mysql", args);
-  const killStatements = stdout.split("\n").map(s => s.trim()).filter(Boolean).join("\n");
-  if (killStatements) {
-    await mysqlExecSql({ conn, sql: killStatements });
-  }
-}
+  await new Promise((resolve, reject) => {
+    const gunzip = createGunzip();
+    const child = spawn("mysql", [...buildMysqlArgs(conn), "-D", db], {
+      stdio: ["pipe", "inherit", "inherit"],
+    });
 
-/** Drop and recreate database cleanly. */
-export async function dropAndRecreateDatabase({ conn, db }) {
-  const sql = `
-    DROP DATABASE IF EXISTS \`${db}\`;
-    CREATE DATABASE \`${db}\`;
-  `;
-  await mysqlExecSql({ conn, sql });
-}
+    let finished = false;
+    const fail = (err) => {
+      if (finished) return;
+      finished = true;
+      try { child.kill("SIGKILL"); } catch {}
+      reject(err);
+    };
+    const ok = () => {
+      if (finished) return;
+      finished = true;
+      resolve();
+    };
 
-/** Restore from a .sql.gz file into the target database. */
-export async function restoreFromSqlGz({ conn, db, sqlGzPath }) {
-  // Prepare mysql client connected to the target DB
-  const args = [...commonMyOpts(conn), db];
-  // gzip -dc file | mysql args
-  const gunzip = execa("gzip", ["-dc", sqlGzPath], { stdout: "pipe" });
-  const mysql = execa("mysql", args, { stdin: "pipe" });
-  gunzip.stdout.pipe(mysql.stdin);
-  await Promise.all([gunzip, mysql]);
-}
+    child.on("error", fail);
+    gunzip.on("error", fail);
 
-/** Inventory tables & views and approximate row counts using information_schema */
-export async function tableInventory({ conn, db }) {
-  // Using information_schema avoids scanning tables
-  const sql = `
-    SELECT TABLE_NAME, TABLE_ROWS, TABLE_TYPE
-    FROM information_schema.TABLES
-    WHERE TABLE_SCHEMA = '${db}';
-  `;
-  const args = [...commonMyOpts(conn), "-N", "-e", sql];
-  const { stdout } = await execa("mysql", args);
+    const rs = createReadStream(sqlGz);
+    rs.on("error", fail);
+    rs.pipe(gunzip).pipe(child.stdin);
 
-  const baseCounts = new Map();
-  const views = new Set();
-  stdout.split("\n").forEach(line => {
-    if (!line) return;
-    const [name, rowsStr, type] = line.split("\t");
-    if (!name || !type) return;
-    if (type === "BASE TABLE") {
-      const n = parseInt(rowsStr || "0", 10);
-      baseCounts.set(name, Number.isFinite(n) ? n : 0);
-    } else if (type === "VIEW") {
-      views.add(name);
-    }
+    child.on("close", (code) => {
+      if (code === 0) ok();
+      else fail(new Error(`mysql exited with code ${code}`));
+    });
   });
-  return { baseCounts, views };
+
+  log.info("RESTORE_STREAM_DONE", { sqlGz, db });
+}
+
+export async function mysqlExecSql(conn, sql) {
+  const args = [...buildMysqlArgs(conn), "-e", sql];
+  await execa("mysql", args, { stdio: ["ignore", "inherit", "inherit"] });
+}
+
+export async function mysqlQueryText(conn, sql) {
+  // Return raw text rows with no headers
+  const args = [...buildMysqlArgs(conn), "--batch", "--raw", "-N", "-e", sql];
+  const { stdout } = await execa("mysql", args, { stdout: "pipe", stderr: "inherit" });
+  return stdout;
+}
+
+export async function killDbConnections(conn, db) {
+  // Generate KILL statements and execute in one shot
+  const killSql =
+    "SELECT CONCAT('KILL ',ID,';') FROM information_schema.PROCESSLIST " +
+    `WHERE DB='${db.replace(/`/g, "``")}' AND ID<>CONNECTION_ID();`;
+  const { stdout } = await execa(
+    "mysql",
+    [...buildMysqlArgs(conn), "-N", "-B", "-e", killSql],
+    { stdout: "pipe", stderr: "inherit" }
+  );
+  const stmts = stdout
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .join(" ");
+  if (stmts) {
+    await mysqlExecSql(conn, stmts);
+  }
+  log.info("KILLED_CONNS", { db });
+}
+
+export async function dropAndRecreateDatabase(conn, db) {
+  const safe = db.replace(/`/g, "``");
+  const sql = `DROP DATABASE IF EXISTS \`${safe}\`; CREATE DATABASE \`${safe}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;`;
+  await mysqlExecSql(conn, sql);
+  log.info("DROP_CREATE_DB", { db });
+}
+
+export async function tableInventory(conn, db) {
+  const safe = db.replace(/`/g, "``");
+  const sql =
+    "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES " +
+    `WHERE TABLE_SCHEMA='${safe}' ORDER BY TABLE_NAME;`;
+  const text = await mysqlQueryText(conn, sql);
+  const tables = [];
+  const views = [];
+  for (const line of text.split("\n")) {
+    if (!line) continue;
+    const [name, type] = line.split("\t");
+    if (type === "BASE TABLE") tables.push(name);
+    else if (type === "VIEW") views.push(name);
+  }
+  return { tables, views };
 }
