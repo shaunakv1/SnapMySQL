@@ -5,25 +5,21 @@ import { createWriteStream, createReadStream, promises as fs } from "node:fs";
 import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { createGzip, createGunzip } from "node:zlib";
+import { pipeline } from "node:stream/promises";
 import { execa } from "execa";
 import { mkLogger } from "./logger.js";
 
 const log = mkLogger("mysql");
 
 function resolvePassword(conn = {}) {
-  // Support several field names + env fallbacks to be resilient to config drift
   const direct =
     conn.password ?? conn.pass ?? conn.pwd ?? conn.PASSWORD ?? conn.secret ?? null;
-
   if (direct) return String(direct);
-
-  // Fallback to env if available (prefers SRC for backup paths, TGT for restore paths)
   const envGuess =
     process.env.SRC_DB_PASSWORD ||
     process.env.TGT_DB_PASSWORD ||
     process.env.DB_PASSWORD ||
     null;
-
   return envGuess ? String(envGuess) : null;
 }
 
@@ -32,21 +28,24 @@ function buildMysqlArgs(conn = {}) {
   if (conn.host) args.push("-h", conn.host);
   if (conn.port) args.push("-P", String(conn.port));
   if (conn.user) args.push("-u", conn.user);
-
   const pw = resolvePassword(conn);
-  if (pw) {
-    // long form is robust and avoids `-p` prompt ambiguity
-    args.push(`--password=${pw}`);
-  }
-
-  // Keep TCP to avoid socket surprises in containerized envs
+  if (pw) args.push(`--password=${pw}`);
   args.push("--protocol=TCP");
   return args;
 }
 
+function waitChild(child, name) {
+  return new Promise((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", (code) => {
+      if (code === 0) return resolve();
+      reject(new Error(`${name} exited with code ${code}`));
+    });
+  });
+}
+
 /**
- * Stream mysqldump -> gzip -> outFile without buffering in Node.
- * Avoids execa's default 100MB maxBuffer.
+ * Stream mysqldump -> gzip -> outFile (no Node buffering).
  */
 export async function mysqldumpFull({ conn, db, outFile }) {
   if (!db) throw new Error("mysqldumpFull: db is required");
@@ -66,83 +65,36 @@ export async function mysqldumpFull({ conn, db, outFile }) {
     db,
   ];
 
-  await new Promise((resolve, reject) => {
-    const gzip = createGzip();
-    const out = createWriteStream(outFile);
-    const child = spawn("mysqldump", dumpArgs, {
-      stdio: ["ignore", "pipe", "inherit"],
-    });
-
-    let finished = false;
-    const fail = (err) => {
-      if (finished) return;
-      finished = true;
-      try { child.kill("SIGKILL"); } catch {}
-      reject(err);
-    };
-    const ok = () => {
-      if (finished) return;
-      finished = true;
-      resolve();
-    };
-
-    child.on("error", fail);
-    out.on("error", fail);
-    gzip.on("error", fail);
-
-    child.stdout.pipe(gzip).pipe(out);
-
-    child.on("close", (code) => {
-      if (code === 0) {
-        out.on("close", ok);
-        out.end();
-      } else {
-        fail(new Error(`mysqldump exited with code ${code}`));
-      }
-    });
+  const child = spawn("mysqldump", dumpArgs, {
+    stdio: ["ignore", "pipe", "inherit"],
   });
 
+  // Pipe stdout -> gzip -> file; concurrently ensure child exits with code 0
+  await Promise.all([
+    pipeline(child.stdout, createGzip(), createWriteStream(outFile)),
+    waitChild(child, "mysqldump"),
+  ]);
+
   const stat = await fs.stat(outFile);
-  // Don't leak secrets: never print full args. Just minimal signal.
   log.info("DUMP_DONE", { outFile, bytes: stat.size, host: conn?.host, db });
   return outFile;
 }
 
+/**
+ * Stream sql.gz -> gunzip -> mysql (stdin).
+ */
 export async function restoreFromSqlGz({ conn, db, sqlGz }) {
   if (!db) throw new Error("restoreFromSqlGz: db is required");
   if (!sqlGz) throw new Error("restoreFromSqlGz: sqlGz is required");
 
-  await new Promise((resolve, reject) => {
-    const gunzip = createGunzip();
-    const child = spawn("mysql", [...buildMysqlArgs(conn), "-D", db], {
-      stdio: ["pipe", "inherit", "inherit"],
-    });
-
-    let finished = false;
-    const fail = (err) => {
-      if (finished) return;
-      finished = true;
-      try { child.kill("SIGKILL"); } catch {}
-      reject(err);
-    };
-    const ok = () => {
-      if (finished) return;
-      finished = true;
-      resolve();
-    };
-
-    child.on("error", fail);
-    gunzip.on("error", fail);
-
-    const rs = createReadStream(sqlGz);
-    rs.on("error", fail);
-    rs.pipe(gunzip).pipe(child.stdin);
-
-    child.on("close", (code) => {
-      if (code === 0) ok();
-      else fail(new Error(`mysql exited with code ${code}`));
-    });
+  const child = spawn("mysql", [...buildMysqlArgs(conn), "-D", db], {
+    stdio: ["pipe", "inherit", "inherit"],
   });
+
+  await Promise.all([
+    pipeline(createReadStream(sqlGz), createGunzip(), child.stdin),
+    waitChild(child, "mysql"),
+  ]);
 
   log.info("RESTORE_STREAM_DONE", { sqlGz, db, host: conn?.host });
 }
@@ -153,14 +105,12 @@ export async function mysqlExecSql(conn, sql) {
 }
 
 export async function mysqlQueryText(conn, sql) {
-  // Return raw text rows with no headers
   const args = [...buildMysqlArgs(conn), "--batch", "--raw", "-N", "-e", sql];
   const { stdout } = await execa("mysql", args, { stdout: "pipe", stderr: "inherit" });
   return stdout;
 }
 
 export async function killDbConnections(conn, db) {
-  // Generate KILL statements and execute in one shot
   const killSql =
     "SELECT CONCAT('KILL ',ID,';') FROM information_schema.PROCESSLIST " +
     `WHERE DB='${db.replace(/`/g, "``")}' AND ID<>CONNECTION_ID();`;
