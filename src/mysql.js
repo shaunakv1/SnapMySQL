@@ -28,7 +28,7 @@ function buildMysqlArgs(conn = {}) {
   if (conn.port) args.push("-P", String(conn.port));
   if (conn.user) args.push("-u", conn.user);
   const pw = resolvePassword(conn);
-  if (pw) args.push("--password=" + pw);
+  if (pw) args.push(`--password=${pw}`);
   args.push("--protocol=TCP");
   return args;
 }
@@ -38,7 +38,7 @@ function waitChild(child, name) {
     child.once("error", reject);
     child.once("close", (code) => {
       if (code === 0) return resolve();
-      reject(new Error("%s exited with code %s".replace("%s", name).replace("%s", code)));
+      reject(new Error(`${name} exited with code ${code}`));
     });
   });
 }
@@ -81,23 +81,32 @@ export async function mysqldumpFull({ conn, db, outFile }) {
 
 /**
  * Stream sql.gz -> gunzip -> mysql (stdin).
- * Accepts both `sqlGz` and legacy `sqlGzPath` for compatibility.
+ * Note: we relax the session guard `sql_require_primary_key` so tables without
+ * a PK can be created exactly as in the source. This change is *session-only*.
  */
 export async function restoreFromSqlGz({ conn, db, sqlGz, sqlGzPath }) {
   if (!db) throw new Error("restoreFromSqlGz: db is required");
-  const gz = sqlGz || sqlGzPath;
-  if (!gz) throw new Error("restoreFromSqlGz: sqlGz (or sqlGzPath) is required");
+  const file = sqlGz || sqlGzPath;
+  if (!file) throw new Error("restoreFromSqlGz: sqlGz is required");
 
-  const child = spawn("mysql", [...buildMysqlArgs(conn), "-D", db], {
+  const mysqlArgs = [
+    ...buildMysqlArgs(conn),
+    // Session-scoped relax: allow tables without PK during this restore only
+    "--init-command=SET SESSION sql_require_primary_key=0",
+    "-D",
+    db,
+  ];
+
+  const child = spawn("mysql", mysqlArgs, {
     stdio: ["pipe", "inherit", "inherit"],
   });
 
   await Promise.all([
-    pipeline(createReadStream(gz), createGunzip(), child.stdin),
+    pipeline(createReadStream(file), createGunzip(), child.stdin),
     waitChild(child, "mysql"),
   ]);
 
-  log.info("RESTORE_STREAM_DONE", { sqlGz: gz, db, host: conn?.host });
+  log.info("RESTORE_STREAM_DONE", { sqlGz: file, db, host: conn?.host });
 }
 
 export async function mysqlExecSql(conn, sql) {
@@ -112,11 +121,13 @@ export async function mysqlQueryText(conn, sql) {
 }
 
 export async function killDbConnections(conn, db) {
-  if (!db) throw new Error("killDbConnections: db is required");
-  const safe = db.replace(/`/g, "``");
+  if (!db) {
+    log.warn("KILL_SKIP_NO_DB");
+    return;
+  }
   const killSql =
     "SELECT CONCAT('KILL ',ID,';') FROM information_schema.PROCESSLIST " +
-    `WHERE DB='${safe}' AND ID<>CONNECTION_ID();`;
+    `WHERE DB='${db.replace(/`/g, "``")}' AND ID<>CONNECTION_ID();`;
   const { stdout } = await execa(
     "mysql",
     [...buildMysqlArgs(conn), "-N", "-B", "-e", killSql],
@@ -134,7 +145,6 @@ export async function killDbConnections(conn, db) {
 }
 
 export async function dropAndRecreateDatabase(conn, db) {
-  if (!db) throw new Error("dropAndRecreateDatabase: db is required");
   const safe = db.replace(/`/g, "``");
   const sql = `DROP DATABASE IF EXISTS \`${safe}\`; CREATE DATABASE \`${safe}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;`;
   await mysqlExecSql(conn, sql);
