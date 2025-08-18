@@ -5,6 +5,7 @@ import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { createGzip, createGunzip } from "node:zlib";
 import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
 import { execa } from "execa";
 import { mkLogger } from "./logger.js";
 
@@ -79,10 +80,47 @@ export async function mysqldumpFull({ conn, db, outFile }) {
   return outFile;
 }
 
+/** Transform stream to strip DEFINER clauses from dump text. */
+function stripDefinersTransform() {
+  let leftover = "";
+  return new Transform({
+    decodeStrings: false,
+    transform(chunk, enc, cb) {
+      try {
+        let text = leftover + chunk;
+        const lines = text.split("\n");
+        leftover = lines.pop() ?? "";
+        const out = lines.map((line) =>
+          line
+            // Remove commented definers like: /*!50017 DEFINER=`user`@`host`*/
+            .replace(/\/\*![0-9]{5}\s+DEFINER=`[^`]+`@`[^`]+`\s*\*\//g, "/* definer stripped */")
+            // Remove inline definers like: CREATE ... DEFINER=`user`@`host` ...
+            .replace(/\s*DEFINER=`[^`]+`@`[^`]+`\s*/g, " ")
+        ).join("\n");
+        cb(null, out);
+      } catch (e) {
+        cb(e);
+      }
+    },
+    flush(cb) {
+      try {
+        if (leftover) {
+          const line = leftover
+            .replace(/\/\*![0-9]{5}\s+DEFINER=`[^`]+`@`[^`]+`\s*\*\//g, "/* definer stripped */")
+            .replace(/\s*DEFINER=`[^`]+`@`[^`]+`\s*/g, " ");
+          this.push(line);
+        }
+        cb();
+      } catch (e) {
+        cb(e);
+      }
+    },
+  });
+}
+
 /**
- * Stream sql.gz -> gunzip -> mysql (stdin).
- * Note: we relax the session guard `sql_require_primary_key` so tables without
- * a PK can be created exactly as in the source. This change is *session-only*.
+ * Stream sql.gz -> gunzip -> strip DEFINER -> mysql (stdin).
+ * Accepts sqlGz or sqlGzPath for compatibility with existing callers.
  */
 export async function restoreFromSqlGz({ conn, db, sqlGz, sqlGzPath }) {
   if (!db) throw new Error("restoreFromSqlGz: db is required");
@@ -91,10 +129,10 @@ export async function restoreFromSqlGz({ conn, db, sqlGz, sqlGzPath }) {
 
   const mysqlArgs = [
     ...buildMysqlArgs(conn),
-    // Session-scoped relax: allow tables without PK during this restore only
-    "--init-command=SET SESSION sql_require_primary_key=0",
     "-D",
     db,
+    // disable PK requirement at session scope if permitted by server
+    "--init-command=SET SESSION sql_require_primary_key=0",
   ];
 
   const child = spawn("mysql", mysqlArgs, {
@@ -102,11 +140,11 @@ export async function restoreFromSqlGz({ conn, db, sqlGz, sqlGzPath }) {
   });
 
   await Promise.all([
-    pipeline(createReadStream(file), createGunzip(), child.stdin),
+    pipeline(createReadStream(file), createGunzip(), stripDefinersTransform(), child.stdin),
     waitChild(child, "mysql"),
   ]);
 
-  log.info("RESTORE_STREAM_DONE", { sqlGz: file, db, host: conn?.host });
+  log.info("RESTORE_STREAM_DONE", { sqlGz: file, db, host: conn?.host, stripDefiners: true });
 }
 
 export async function mysqlExecSql(conn, sql) {
@@ -121,13 +159,15 @@ export async function mysqlQueryText(conn, sql) {
 }
 
 export async function killDbConnections(conn, db) {
-  if (!db) {
-    log.warn("KILL_SKIP_NO_DB");
+  const dbName = db ?? conn?.database ?? conn?.db ?? null;
+  if (!dbName) {
+    log.warn("KILL_SKIP_NO_DB", { reason: "no-db-name" });
     return;
   }
+  const safeDb = dbName.replace(/`/g, "``");
   const killSql =
     "SELECT CONCAT('KILL ',ID,';') FROM information_schema.PROCESSLIST " +
-    `WHERE DB='${db.replace(/`/g, "``")}' AND ID<>CONNECTION_ID();`;
+    `WHERE DB='${safeDb}' AND ID<>CONNECTION_ID();`;
   const { stdout } = await execa(
     "mysql",
     [...buildMysqlArgs(conn), "-N", "-B", "-e", killSql],
@@ -141,7 +181,7 @@ export async function killDbConnections(conn, db) {
   if (stmts) {
     await mysqlExecSql(conn, stmts);
   }
-  log.info("KILLED_CONNS", { db });
+  log.info("KILLED_CONNS", { db: safeDb });
 }
 
 export async function dropAndRecreateDatabase(conn, db) {
