@@ -5,7 +5,6 @@ import { dirname } from "node:path";
 import { mkdir } from "node:fs/promises";
 import { createGzip, createGunzip } from "node:zlib";
 import { pipeline } from "node:stream/promises";
-import { Transform } from "node:stream";
 import { execa } from "execa";
 import { mkLogger } from "./logger.js";
 
@@ -80,71 +79,51 @@ export async function mysqldumpFull({ conn, db, outFile }) {
   return outFile;
 }
 
-/** Transform stream to strip DEFINER clauses from dump text. */
-function stripDefinersTransform() {
-  let leftover = "";
-  return new Transform({
-    decodeStrings: false,
-    transform(chunk, enc, cb) {
-      try {
-        let text = leftover + chunk;
-        const lines = text.split("\n");
-        leftover = lines.pop() ?? "";
-        const out = lines.map((line) =>
-          line
-            // Remove commented definers like: /*!50017 DEFINER=`user`@`host`*/
-            .replace(/\/\*![0-9]{5}\s+DEFINER=`[^`]+`@`[^`]+`\s*\*\//g, "/* definer stripped */")
-            // Remove inline definers like: CREATE ... DEFINER=`user`@`host` ...
-            .replace(/\s*DEFINER=`[^`]+`@`[^`]+`\s*/g, " ")
-        ).join("\n");
-        cb(null, out);
-      } catch (e) {
-        cb(e);
-      }
-    },
-    flush(cb) {
-      try {
-        if (leftover) {
-          const line = leftover
-            .replace(/\/\*![0-9]{5}\s+DEFINER=`[^`]+`@`[^`]+`\s*\*\//g, "/* definer stripped */")
-            .replace(/\s*DEFINER=`[^`]+`@`[^`]+`\s*/g, " ");
-          this.push(line);
-        }
-        cb();
-      } catch (e) {
-        cb(e);
-      }
-    },
-  });
-}
-
 /**
- * Stream sql.gz -> gunzip -> strip DEFINER -> mysql (stdin).
- * Accepts sqlGz or sqlGzPath for compatibility with existing callers.
+ * Stream sql.gz -> gunzip -> sed (strip DEFINER/SQL SECURITY) -> mysql (stdin).
+ * Also disables SESSION sql_require_primary_key during load to bypass PK enforcement.
+ * Accepts either {sqlGzPath} or {sqlGz}.
  */
-export async function restoreFromSqlGz({ conn, db, sqlGz, sqlGzPath }) {
+export async function restoreFromSqlGz({ conn, db, sqlGzPath, sqlGz }) {
+  const inPath = sqlGzPath ?? sqlGz;
   if (!db) throw new Error("restoreFromSqlGz: db is required");
-  const file = sqlGz || sqlGzPath;
-  if (!file) throw new Error("restoreFromSqlGz: sqlGz is required");
+  if (!inPath) throw new Error("restoreFromSqlGz: sqlGz is required");
 
-  const mysqlArgs = [
-    ...buildMysqlArgs(conn),
-    "-D",
-    db,
-    // disable PK requirement at session scope if permitted by server
-    "--init-command=SET SESSION sql_require_primary_key=0",
+  // sed filters (GNU sed, extended regex)
+  const sedFilters = [
+    // Strip /*!xxxxx ... DEFINER=... */ comment clauses
+    's:/\\*![0-9]{5}[^*]*DEFINER=[^*]*\\*/::g',
+    // Strip inline DEFINER=... in CREATE VIEW/ROUTINE/TRIGGER/EVENT
+    's:DEFINER=`[^`]+`@`[^`]+`::g',
+    // Normalize security model to INVOKER (optional, avoids SUPER)
+    's:SQL SECURITY DEFINER:SQL SECURITY INVOKER:g',
   ];
+  const sedArgs = ["-u", "-E"];
+  for (const f of sedFilters) sedArgs.push("-e", f);
 
-  const child = spawn("mysql", mysqlArgs, {
+  const sed = spawn("sed", sedArgs, { stdio: ["pipe", "pipe", "inherit"] });
+  const mysql = spawn("mysql", [...buildMysqlArgs(conn), "-D", db], {
     stdio: ["pipe", "inherit", "inherit"],
   });
 
-  await Promise.all([
-    pipeline(createReadStream(file), createGunzip(), stripDefinersTransform(), child.stdin),
-    waitChild(child, "mysql"),
-  ]);
+  // 1) Prelude: relax PK requirement at SESSION level only (no SUPER needed)
+  const prelude = "SET SESSION sql_require_primary_key = 0;\n";
+  await new Promise((res, rej) => mysql.stdin.write(prelude, (e) => (e ? rej(e) : res())));
 
-  log.info("RESTORE_STREAM_DONE", { sqlGz: file, db, host: conn?.host, stripDefiners: true });
+  // 2) Start data stream: sql.gz -> gunzip -> sed(in) -> sed(out) -> mysql stdin
+  const gunzip = createGunzip();
+  const read = createReadStream(inPath);
+
+  // Pipe the transformed dump into mysql stdin (after prelude)
+  const pumpToMysql = pipeline(sed.stdout, mysql.stdin);
+
+  // Feed sed from gunzip
+  const pumpIntoSed = pipeline(read, gunzip, sed.stdin);
+
+  // Wait for both pipelines + child processes
+  await Promise.all([pumpIntoSed, pumpToMysql, waitChild(sed, "sed"), waitChild(mysql, "mysql")]);
+
+  log.info("RESTORE_STREAM_DONE", { sqlGz: inPath, db, host: conn?.host });
 }
 
 export async function mysqlExecSql(conn, sql) {
@@ -159,15 +138,14 @@ export async function mysqlQueryText(conn, sql) {
 }
 
 export async function killDbConnections(conn, db) {
-  const dbName = db ?? conn?.database ?? conn?.db ?? null;
-  if (!dbName) {
-    log.warn("KILL_SKIP_NO_DB", { reason: "no-db-name" });
+  if (!db) {
+    log.warn("KILL_SKIP_NO_DB", {});
     return;
   }
-  const safeDb = dbName.replace(/`/g, "``");
+  const safe = db.replace(/`/g, "``");
   const killSql =
     "SELECT CONCAT('KILL ',ID,';') FROM information_schema.PROCESSLIST " +
-    `WHERE DB='${safeDb}' AND ID<>CONNECTION_ID();`;
+    `WHERE DB='${safe}' AND ID<>CONNECTION_ID();`;
   const { stdout } = await execa(
     "mysql",
     [...buildMysqlArgs(conn), "-N", "-B", "-e", killSql],
@@ -181,7 +159,7 @@ export async function killDbConnections(conn, db) {
   if (stmts) {
     await mysqlExecSql(conn, stmts);
   }
-  log.info("KILLED_CONNS", { db: safeDb });
+  log.info("KILLED_CONNS", { db });
 }
 
 export async function dropAndRecreateDatabase(conn, db) {
