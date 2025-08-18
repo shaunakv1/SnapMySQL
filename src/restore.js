@@ -111,9 +111,9 @@ export async function runRestore(rid = newRid("r"), cliOpts = null) {
     if (!sqlGzPath) throw new Error("Extracted archive missing .sql.gz");
     const fullSqlGzPath = path.join(workdir, sqlGzPath);
 
-    await killDbConnections({ conn: cfg.tgt, db });
+    await killDbConnections(cfg.tgt, db);
     log.info("R_KILL_OK", { rid, db });
-    await dropAndRecreateDatabase({ conn: cfg.tgt, db });
+    await dropAndRecreateDatabase(cfg.tgt, db);
     log.info("R_DROPCREATE_OK", { rid, db });
 
     const t0 = Date.now();

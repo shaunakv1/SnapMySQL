@@ -1,4 +1,3 @@
-
 // src/mysql.js
 import { spawn } from "node:child_process";
 import { createWriteStream, createReadStream, promises as fs } from "node:fs";
@@ -111,9 +110,11 @@ export async function mysqlQueryText(conn, sql) {
 }
 
 export async function killDbConnections(conn, db) {
+  if (!db) throw new Error("killDbConnections: db is required");
+  const safe = db.replace(/`/g, "``");
   const killSql =
     "SELECT CONCAT('KILL ',ID,';') FROM information_schema.PROCESSLIST " +
-    `WHERE DB='${db.replace(/`/g, "``")}' AND ID<>CONNECTION_ID();`;
+    `WHERE DB='${safe}' AND ID<>CONNECTION_ID();`;
   const { stdout } = await execa(
     "mysql",
     [...buildMysqlArgs(conn), "-N", "-B", "-e", killSql],
@@ -131,13 +132,17 @@ export async function killDbConnections(conn, db) {
 }
 
 export async function dropAndRecreateDatabase(conn, db) {
+  if (!db) throw new Error("dropAndRecreateDatabase: db is required");
   const safe = db.replace(/`/g, "``");
-  const sql = `DROP DATABASE IF EXISTS \`${safe}\`; CREATE DATABASE \`${safe}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;`;
+  const sql = 
+    `DROP DATABASE IF EXISTS \`${safe}\`; ` +
+    `CREATE DATABASE \`${safe}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_bin;`;
   await mysqlExecSql(conn, sql);
   log.info("DROP_CREATE_DB", { db });
 }
 
 export async function tableInventory(conn, db) {
+  if (!db) throw new Error("tableInventory: db is required");
   const safe = db.replace(/`/g, "``");
   const sql =
     "SELECT TABLE_NAME, TABLE_TYPE FROM information_schema.TABLES " +

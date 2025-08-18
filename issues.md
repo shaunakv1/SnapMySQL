@@ -4,3 +4,5 @@
 3. validate connectivity to source and target dbs before running backup or restores
 
 4. Track and log memory used in the backup and restore process
+
+5. Verfify database password resolution in mysql.js
